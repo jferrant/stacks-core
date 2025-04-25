@@ -18,6 +18,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use blockstack_lib::chainstate::burn::ConsensusHashExtensions;
 use blockstack_lib::chainstate::nakamoto::{NakamotoBlock, NakamotoBlockHeader};
+use blockstack_lib::chainstate::stacks::{StacksTransaction, TransactionPayload};
 use clarity::types::chainstate::StacksAddress;
 use libsigner::v0::messages::{
     MessageSlotID, SignerMessage, StateMachineUpdate as StateMachineUpdateMessage,
@@ -150,6 +151,7 @@ impl GlobalStateEvaluator {
                 burn_block_height: *burn_block_height,
                 current_miner: current_miner.into(),
                 active_signer_protocol_version,
+                tx_replay_set: None,
             };
             let entry = state_views
                 .entry(state_machine.clone())
@@ -246,6 +248,8 @@ pub struct SignerStateMachine {
     pub current_miner: MinerState,
     /// The active signing protocol version
     pub active_signer_protocol_version: u64,
+    /// Transaction replay set
+    pub tx_replay_set: Option<Vec<StacksTransaction>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Eq, Hash)]
@@ -313,7 +317,16 @@ pub enum LocalStateMachine {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StateMachineUpdate {
     /// A new burn block at height u64 is expected
-    BurnBlock(u64),
+    BurnBlock(NewBurnBlock),
+}
+
+/// Minimal struct for a new burn block
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewBurnBlock {
+    /// The height of the new burn block
+    pub burn_block_height: u64,
+    /// The hash of the new burn block
+    pub consensus_hash: ConsensusHash,
 }
 
 impl TryInto<StateMachineUpdateMessage> for &LocalStateMachine {
@@ -375,6 +388,7 @@ impl LocalStateMachine {
             burn_block_height: 0,
             current_miner: MinerState::NoValidMiner,
             active_signer_protocol_version: SUPPORTED_SIGNER_PROTOCOL_VERSION,
+            tx_replay_set: None,
         }
     }
 
@@ -668,7 +682,7 @@ impl LocalStateMachine {
         db: &SignerDb,
         client: &StacksClient,
         proposal_config: &ProposalEvalConfig,
-        mut expected_burn_height: Option<u64>,
+        mut expected_burn_block: Option<NewBurnBlock>,
     ) -> Result<(), SignerChainstateError> {
         // set self to uninitialized so that if this function errors,
         //  self is left as uninitialized.
@@ -682,31 +696,99 @@ impl LocalStateMachine {
                 //  but if we have other kinds of pending updates, this logic will need
                 //  to be changed.
                 match update {
-                    StateMachineUpdate::BurnBlock(pending_burn_height) => {
-                        if pending_burn_height > expected_burn_height.unwrap_or(0) {
-                            expected_burn_height = Some(pending_burn_height);
+                    StateMachineUpdate::BurnBlock(pending_burn_block) => {
+                        match expected_burn_block {
+                            None => expected_burn_block = Some(pending_burn_block),
+                            Some(ref expected) => {
+                                if pending_burn_block.burn_block_height > expected.burn_block_height
+                                {
+                                    expected_burn_block = Some(pending_burn_block);
+                                }
+                            }
                         }
                     }
                 }
 
-                prior
+                prior.clone()
             }
         };
 
         let peer_info = client.get_peer_info()?;
         let next_burn_block_height = peer_info.burn_block_height;
         let next_burn_block_hash = peer_info.pox_consensus;
+        let mut tx_replay_set = prior_state_machine.tx_replay_set.clone();
 
-        if let Some(expected_burn_height) = expected_burn_height {
-            if next_burn_block_height < expected_burn_height {
+        if let Some(expected_burn_block) = expected_burn_block {
+            // If the next height is less than the expected height, we need to wait.
+            // OR if the next height is the same, but with a different hash, we need to wait.
+            if next_burn_block_height < expected_burn_block.burn_block_height || {
+                next_burn_block_height == expected_burn_block.burn_block_height
+                    && next_burn_block_hash != expected_burn_block.consensus_hash
+            } {
+                let err_msg = format!(
+                    "Node has not processed the next burn block ({}) yet",
+                    expected_burn_block.burn_block_height
+                );
                 *self = Self::Pending {
-                    update: StateMachineUpdate::BurnBlock(expected_burn_height),
+                    update: StateMachineUpdate::BurnBlock(expected_burn_block),
                     prior: prior_state_machine,
                 };
-                return Err(ClientError::InvalidResponse(
-                    "Node has not processed the next burn block yet".into(),
-                )
-                .into());
+                return Err(ClientError::InvalidResponse(err_msg).into());
+            }
+            if expected_burn_block.burn_block_height <= prior_state_machine.burn_block_height
+                && expected_burn_block.consensus_hash != prior_state_machine.burn_block
+                // TODO: handle fork while still in replay
+                && tx_replay_set.is_none()
+            {
+                info!("Signer State: fork detected";
+                    "expected_burn_block.height" => expected_burn_block.burn_block_height,
+                    "expected_burn_block.hash" => %expected_burn_block.consensus_hash,
+                    "next_burn_block_height" => next_burn_block_height,
+                    "next_burn_block_hash" => %next_burn_block_hash,
+                    "prior_state_machine.burn_block_height" => prior_state_machine.burn_block_height,
+                    "prior_state_machine.burn_block" => %prior_state_machine.burn_block,
+                );
+                // Determine the tenures that were forked
+                let mut sortition_info =
+                    client.get_sortition_by_consensus_hash(&prior_state_machine.burn_block)?;
+                let last_forked_tenure = prior_state_machine.burn_block;
+                let mut first_forked_tenure = prior_state_machine.burn_block;
+                let mut forked_tenures = vec![(
+                    prior_state_machine.burn_block,
+                    prior_state_machine.burn_block_height,
+                )];
+                while sortition_info.burn_block_height > expected_burn_block.burn_block_height {
+                    let Some(stacks_parent_ch) = sortition_info.stacks_parent_ch else {
+                        info!("No stacks parent ch found for sortition info";
+                            "sortition_info" => ?sortition_info,
+                        );
+                        break;
+                    };
+                    sortition_info = client.get_sortition_by_consensus_hash(&stacks_parent_ch)?;
+                    first_forked_tenure = sortition_info.consensus_hash;
+                    forked_tenures.push((stacks_parent_ch, sortition_info.burn_block_height));
+                }
+                let fork_info =
+                    client.get_tenure_forking_info(&first_forked_tenure, &last_forked_tenure)?;
+                let forked_txs = fork_info
+                    .iter()
+                    .flat_map(|fork_info| {
+                        fork_info
+                            .nakamoto_blocks
+                            .iter()
+                            .flat_map(|blocks| blocks.iter())
+                            .flat_map(|block| block.txs.iter())
+                    })
+                    .cloned()
+                    .filter(|tx| match tx.payload {
+                        // Don't include Coinbase, TenureChange, or PoisonMicroblock transactions
+                        TransactionPayload::TenureChange(..)
+                        | TransactionPayload::Coinbase(..)
+                        | TransactionPayload::PoisonMicroblock(..) => false,
+                        _ => true,
+                    })
+                    .collect::<Vec<_>>();
+                tx_replay_set = Some(forked_txs);
             }
         }
 
@@ -750,6 +832,7 @@ impl LocalStateMachine {
             burn_block_height: next_burn_block_height,
             current_miner: miner_state,
             active_signer_protocol_version: prior_state_machine.active_signer_protocol_version,
+            tx_replay_set,
         });
 
         if prior_state != *self {
@@ -794,6 +877,7 @@ impl LocalStateMachine {
                 burn_block_height: *burn_block_height,
                 current_miner: current_miner.into(),
                 active_signer_protocol_version,
+                tx_replay_set: None,
             });
             // Because we updated our active signer protocol version, update local_update so its included in the subsequent evaluations
             let update: Result<StateMachineUpdateMessage, _> = (&*self).try_into();
@@ -826,6 +910,7 @@ impl LocalStateMachine {
                 burn_block_height,
                 current_miner: (&new_miner).into(),
                 active_signer_protocol_version,
+                tx_replay_set: None,
             });
         }
     }
