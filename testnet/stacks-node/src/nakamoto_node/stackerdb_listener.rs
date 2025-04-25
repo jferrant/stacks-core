@@ -29,7 +29,7 @@ use stacks::chainstate::burn::BlockSnapshot;
 use stacks::chainstate::nakamoto::NakamotoBlockHeader;
 use stacks::chainstate::stacks::boot::{NakamotoSignerEntry, RewardSet, SIGNERS_NAME};
 use stacks::chainstate::stacks::events::StackerDBChunksEvent;
-use stacks::chainstate::stacks::Error as ChainstateError;
+use stacks::chainstate::stacks::{Error as ChainstateError, StacksTransaction};
 use stacks::types::chainstate::StacksPublicKey;
 use stacks::types::PublicKey;
 use stacks::util::get_epoch_time_secs;
@@ -68,6 +68,12 @@ pub(crate) struct TimestampInfo {
     pub weight: u32,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReplayInfo {
+    pub transactions: Vec<StacksTransaction>,
+    pub weight: u32,
+}
+
 /// The listener for the StackerDB, which listens for messages from the
 /// signers and tracks the state of block signatures and idle timestamps.
 pub struct StackerDBListener {
@@ -96,6 +102,11 @@ pub struct StackerDBListener {
     ///  - key: StacksPublicKey
     ///  - value: TimestampInfo
     pub(crate) signer_idle_timestamps: Arc<Mutex<HashMap<StacksPublicKey, TimestampInfo>>>,
+    /// Tracks any replay transactions from signers to decide when the miner should
+    /// attempt to replay reorged blocks
+    ///  - key: StacksPublicKey
+    ///  - value: Vec<StacksTransaction>
+    pub(crate) replay_info: Arc<Mutex<HashMap<StacksPublicKey, ReplayInfo>>>,
 }
 
 /// Interface for other threads to retrieve info from the StackerDBListener
@@ -109,6 +120,11 @@ pub struct StackerDBListenerComms {
     ///  - key: StacksPublicKey
     ///  - value: TimestampInfo
     signer_idle_timestamps: Arc<Mutex<HashMap<StacksPublicKey, TimestampInfo>>>,
+    /// Tracks any replay transactions from signers to decide when the miner should
+    /// attempt to replay reorged blocks
+    ///  - key: StacksPublicKey
+    ///  - value: ReplayInfo
+    replay_info: Arc<Mutex<HashMap<StacksPublicKey, ReplayInfo>>>,
 }
 
 impl StackerDBListener {
@@ -172,6 +188,7 @@ impl StackerDBListener {
             signer_entries,
             blocks: Arc::new((Mutex::new(HashMap::new()), Condvar::new())),
             signer_idle_timestamps: Arc::new(Mutex::new(HashMap::new())),
+            replay_info: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -179,6 +196,7 @@ impl StackerDBListener {
         StackerDBListenerComms {
             blocks: self.blocks.clone(),
             signer_idle_timestamps: self.signer_idle_timestamps.clone(),
+            replay_info: self.replay_info.clone(),
         }
     }
 
@@ -446,6 +464,8 @@ impl StackerDBListener {
                         debug!("Received mock message. Ignoring.");
                     }
                     SignerMessageV0::StateMachineUpdate(_) => {
+                        // TODO: Once we have minimum of 30% of signers reporting a need for a replay
+                        // We could immediately attempt to replay or we could wait for 70% of signers...
                         debug!("Received state machine update message. Ignoring.");
                     }
                 };
@@ -596,5 +616,32 @@ impl StackerDBListenerComms {
         // time, so return u64::MAX to indicate that we should not extend the
         // tenure.
         u64::MAX
+    }
+
+    /// Get the transactions that at least 70% of the signing power expect to be replayed in
+    /// the next stacks block
+    pub fn get_replay_transactions(&self, weight_threshold: u32) -> Vec<StacksTransaction> {
+        let replay_info = self
+            .replay_info
+            .lock()
+            .expect("FATAL: failed to lock replay transactions");
+        debug!("SignerCoordinator: replay_info: {replay_info:?}");
+        let replay_info = replay_info.values().collect::<Vec<_>>();
+        let mut weights: HashMap<&Vec<StacksTransaction>, u32> = HashMap::new();
+        for info in replay_info {
+            // We only care about signers voting for us to replay a specific set of transactions
+            if info.transactions.is_empty() {
+                continue;
+            }
+            let entry = weights.entry(&info.transactions).or_default();
+            *entry += info.weight;
+            if info.weight >= weight_threshold {
+                debug!("SignerCoordinator: threshold reached to attempt replay transactions";
+                    "transactions" => ?info.transactions,
+                );
+                return info.transactions.clone();
+            }
+        }
+        vec![]
     }
 }
