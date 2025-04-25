@@ -22,7 +22,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use hashbrown::{HashMap, HashSet};
-use libsigner::v0::messages::{BlockAccepted, BlockResponse, SignerMessage as SignerMessageV0};
+use libsigner::v0::messages::{
+    BlockAccepted, BlockResponse, SignerMessage as SignerMessageV0, StateMachineUpdate,
+    StateMachineUpdateContent,
+};
 use libsigner::SignerEvent;
 use stacks::burnchains::Burnchain;
 use stacks::chainstate::burn::BlockSnapshot;
@@ -463,10 +466,8 @@ impl StackerDBListener {
                     | SignerMessageV0::MockBlock(_) => {
                         debug!("Received mock message. Ignoring.");
                     }
-                    SignerMessageV0::StateMachineUpdate(_) => {
-                        // TODO: Once we have minimum of 30% of signers reporting a need for a replay
-                        // We could immediately attempt to replay or we could wait for 70% of signers...
-                        debug!("Received state machine update message. Ignoring.");
+                    SignerMessageV0::StateMachineUpdate(update) => {
+                        self.update_replay_info(signer_pubkey, update, signer_entry.weight);
                     }
                 };
             }
@@ -490,6 +491,31 @@ impl StackerDBListener {
         // Update the map with the new timestamp and weight
         let timestamp_info = TimestampInfo { timestamp, weight };
         idle_timestamps.insert(signer_pubkey, timestamp_info);
+    }
+
+    fn update_replay_info(
+        &self,
+        signer_pubkey: StacksPublicKey,
+        update: StateMachineUpdate,
+        weight: u32,
+    ) {
+        let mut replay_infos = self
+            .replay_info
+            .lock()
+            .expect("FATAL: failed to lock replay info");
+        match update.content {
+            StateMachineUpdateContent::V0 { .. } => {}
+            StateMachineUpdateContent::V1 {
+                replay_transactions,
+                ..
+            } => {
+                let info = ReplayInfo {
+                    transactions: replay_transactions,
+                    weight,
+                };
+                replay_infos.insert(signer_pubkey, info);
+            }
+        }
     }
 
     /// Do we ignore signer signatures?
@@ -618,8 +644,7 @@ impl StackerDBListenerComms {
         u64::MAX
     }
 
-    /// Get the transactions that at least 70% of the signing power expect to be replayed in
-    /// the next stacks block
+    /// Get the transactions that a threshold weight of signers is reporting
     pub fn get_replay_transactions(&self, weight_threshold: u32) -> Vec<StacksTransaction> {
         let replay_info = self
             .replay_info
@@ -633,9 +658,11 @@ impl StackerDBListenerComms {
             if info.transactions.is_empty() {
                 continue;
             }
+            // We got transactions?
             let entry = weights.entry(&info.transactions).or_default();
             *entry += info.weight;
-            if info.weight >= weight_threshold {
+            if *entry >= weight_threshold {
+                debug!("HERE TXS ?");
                 debug!("SignerCoordinator: threshold reached to attempt replay transactions";
                     "transactions" => ?info.transactions,
                 );

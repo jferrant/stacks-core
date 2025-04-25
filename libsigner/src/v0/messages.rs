@@ -571,6 +571,17 @@ pub enum StateMachineUpdateContent {
         /// The signer's view of who the current miner should be (and their tenure building info)
         current_miner: StateMachineUpdateMinerState,
     },
+    /// Version 1
+    V1 {
+        /// The tip burn block (i.e., the latest bitcoin block) seen by this signer
+        burn_block: ConsensusHash,
+        /// The tip burn block height (i.e., the latest bitcoin block) seen by this signer
+        burn_block_height: u64,
+        /// The signer's view of who the current miner should be (and their tenure building info)
+        current_miner: StateMachineUpdateMinerState,
+        /// When a bitcoin fork occurs, the expected transactions to replay in the next stacks blocks
+        replay_transactions: Vec<StacksTransaction>,
+    },
 }
 
 /// Message for update the Signer State infos
@@ -676,6 +687,7 @@ impl StateMachineUpdateContent {
     fn is_protocol_version_compatible(&self, version: u64) -> bool {
         match self {
             Self::V0 { .. } => version == 0,
+            Self::V1 { .. } => version == 1,
         }
     }
 
@@ -690,6 +702,17 @@ impl StateMachineUpdateContent {
                 burn_block_height.consensus_serialize(fd)?;
                 current_miner.consensus_serialize(fd)?;
             }
+            Self::V1 {
+                burn_block,
+                burn_block_height,
+                current_miner,
+                replay_transactions,
+            } => {
+                burn_block.consensus_serialize(fd)?;
+                burn_block_height.consensus_serialize(fd)?;
+                current_miner.consensus_serialize(fd)?;
+                replay_transactions.consensus_serialize(fd)?;
+            }
         }
         Ok(())
     }
@@ -703,6 +726,18 @@ impl StateMachineUpdateContent {
                     burn_block,
                     burn_block_height,
                     current_miner,
+                })
+            }
+            1 => {
+                let burn_block = read_next(fd)?;
+                let burn_block_height = read_next(fd)?;
+                let current_miner = read_next(fd)?;
+                let replay_transactions = read_next(fd)?;
+                Ok(Self::V1 {
+                    burn_block,
+                    burn_block_height,
+                    current_miner,
+                    replay_transactions,
                 })
             }
             other => Err(CodecError::DeserializeError(format!(

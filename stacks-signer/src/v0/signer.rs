@@ -49,7 +49,7 @@ use crate::client::{ClientError, SignerSlotID, StackerDB, StacksClient};
 use crate::config::{SignerConfig, SignerConfigMode};
 use crate::runloop::SignerResult;
 use crate::signerdb::{BlockInfo, BlockState, SignerDb};
-use crate::v0::signer_state::NewBurnBlock;
+use crate::v0::signer_state::{NewBurnBlock, SignerStateMachine};
 use crate::Signer as SignerTrait;
 
 /// A global variable that can be used to make signers repeat their proposal
@@ -415,7 +415,15 @@ impl SignerTrait<SignerMessage> for Signer {
                 }
             }
         }
-        if prior_state != self.local_state_machine {
+        let should_send_update = match &self.local_state_machine {
+            LocalStateMachine::Initialized(SignerStateMachine {
+                tx_replay_set: Some(txs),
+                ..
+            }) => !txs.is_empty(),
+            _ => prior_state != self.local_state_machine,
+        };
+
+        if should_send_update {
             self.local_state_machine
                 .send_signer_update_message(&mut self.stackerdb);
         }

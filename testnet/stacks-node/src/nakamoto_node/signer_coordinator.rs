@@ -484,8 +484,8 @@ impl SignerCoordinator {
             .get_tenure_extend_timestamp(self.weight_threshold)
     }
 
-    /// Get the transactions that at least 70% of the signing power are
-    /// expecting to be replayed.
+    /// Get the replay transactions at least 70% of the signing power expects
+    /// in the subsequent blocks
     pub fn get_replay_transactions(&self) -> Vec<StacksTransaction> {
         self.stackerdb_comms
             .get_replay_transactions(self.weight_threshold)

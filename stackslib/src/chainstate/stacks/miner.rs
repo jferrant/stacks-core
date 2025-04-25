@@ -74,6 +74,9 @@ use crate::net::Error as net_error;
 #[cfg(any(test, feature = "testing"))]
 /// Test flag to stall transaction execution
 pub static TEST_TX_STALL: LazyLock<TestFlag<bool>> = LazyLock::new(TestFlag::default);
+#[cfg(any(test, feature = "testing"))]
+/// Test flag to stall transaction execution
+pub static TEST_IGNORE_REPLAY_TXS: LazyLock<TestFlag<bool>> = LazyLock::new(TestFlag::default);
 
 /// Stall transaction processing for testing
 #[cfg(any(test, feature = "testing"))]
@@ -90,6 +93,21 @@ fn fault_injection_stall_tx() {
 
 #[cfg(not(any(test, feature = "testing")))]
 fn fault_injection_stall_tx() {}
+
+/// Ignore replay transactions for testing
+#[cfg(any(test, feature = "testing"))]
+fn fault_injection_ignore_replay_txs() -> bool {
+    let ignore = TEST_IGNORE_REPLAY_TXS.get();
+    if ignore {
+        warn!("Miner is ignoring replay transactions due to testing directive.");
+    }
+    ignore
+}
+
+#[cfg(not(any(test, feature = "testing")))]
+fn fault_injection_ignore_replay_txs() -> bool {
+    false
+}
 
 /// Fully-assembled Stacks anchored, block as well as some extra metadata pertaining to how it was
 /// linked to the burnchain and what view(s) the miner had of the burnchain before and after
@@ -2302,8 +2320,12 @@ impl StacksBlockBuilder {
                 return Ok((false, tx_events));
             }
         }
-
-        let result = if replay_transactions.is_empty() {
+        let ignore_txs = if fault_injection_ignore_replay_txs() {
+            replay_transactions
+        } else {
+            &[]
+        };
+        let result = if replay_transactions.is_empty() && ignore_txs.is_empty() {
             select_and_apply_transactions_from_mempool(
                 epoch_tx,
                 builder,
@@ -2312,6 +2334,7 @@ impl StacksBlockBuilder {
                 settings,
                 event_observer,
                 ast_rules,
+                ignore_txs,
             )
         } else {
             Ok((
@@ -2722,6 +2745,7 @@ pub fn select_and_apply_transactions_from_mempool<B: BlockBuilder>(
     settings: BlockBuilderSettings,
     event_observer: Option<&dyn MemPoolEventDispatcher>,
     ast_rules: ASTRules,
+    ignore_txs: &[StacksTransaction],
 ) -> Result<(Vec<TransactionEvent>, bool), Error> {
     let mut tx_events = vec![];
     let max_miner_time_ms = settings.max_miner_time_ms;
@@ -2735,6 +2759,9 @@ pub fn select_and_apply_transactions_from_mempool<B: BlockBuilder>(
 
     let mut block_limit_hit = BlockLimitFunction::NO_LIMIT_HIT;
     let mut considered = HashSet::new(); // txids of all transactions we looked at
+    for ignore in ignore_txs {
+        considered.insert(ignore.txid());
+    }
 
     let mut invalidated_txs = vec![];
     let mut to_drop_and_blacklist = vec![];
